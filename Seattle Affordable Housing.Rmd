@@ -1,0 +1,148 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidycensus)
+library(tidyverse)
+library(viridis)
+library(tigris)
+library(sf)
+library(sp)
+library(mapview)
+library(corrplot)
+options(tigris_use_cache = TRUE)
+
+census_api_key('INSERT API KEY')
+
+# demographics and housing
+acsDnHMeta <- read.csv("data/acs demographics and housing estimates/ACSDP5Y2019.DP05_metadata_2021-04-18T170910.csv", stringsAsFactors = FALSE)
+
+# financial characters
+acsFinCharMeta <- read.csv("data/acs financial characteristics/ACSST5Y2019.S2503_metadata_2021-04-18T171608.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+#racial and social equity index 
+raceAndSocialEquityIndex <- read.csv("data/racialSocialEquityIndex.csv", stringsAsFactors = FALSE) %>%
+                            mutate(tract = NAMELSAD10)
+
+#demographics and housing estimates via ACS Demogrphic and Housing Estimates 5 Year 2019:
+acsDemographicsAndHousing <- read.csv("data/acs demographics and housing estimates/ACSDP5Y2019.DP05_data_with_overlays_2021-04-18T170910.csv", stringsAsFactors = FALSE) %>% 
+  slice(-1) %>%
+  mutate(tract = str_split(NAME, ", ", simplify = TRUE)[, 1]) %>% 
+  mutate(tractNumber = as.numeric(str_split(tract, " ", simplify = TRUE)[, 3])) %>%
+  filter(tractNumber < 200)
+
+#financial characteristics via ACS Financial Characteristics Estimates 5 Year 2019:
+acsFinancialCharacteristics <- read.csv("data/acs financial characteristics/ACSST5Y2019.S2503_data_with_overlays_2021-04-18T171608.csv", stringsAsFactors = FALSE) %>%
+  slice(-1) %>%
+  mutate(tract = str_split(NAME, ", ", simplify = TRUE)[, 1]) %>% 
+  mutate(tractNumber = as.numeric(str_split(tract, " ", simplify = TRUE)[, 3])) %>%
+  filter(tractNumber < 200)
+
+relevantVariables <- c("B01003_001", "B02001_002", "B02001_003", "B02001_005")
+```
+
+
+
+```{r}
+# king county demographic information (2017): https://gis-kingcounty.opendata.arcgis.com/datasets/e23a07e847a7440dabac76ede52b521d_2687?geometry=-124.569%2C47.184%2C-119.295%2C47.834
+kingCountyDemographics <- read.csv("data/kingCountyDemographics.csv", stringsAsFactors = FALSE)  %>%
+                            mutate(tract = TRACT_LBL) %>%
+                            mutate(tractNumber = as.numeric(str_split(tract, " ", simplify = TRUE)[, 2])/100) %>%
+                            select(ESL_Score, Income_Score, RE_Score, TotalScore, WeightedTotal333333, Population, NumberofESL, PercentESL, MedianHouseholdIncome, NumberofPOC, PercentPOC, tractNumber)
+
+# set criteria for "large development"
+largeDevelopment <- 14
+
+# king county public housing: 
+#https://hudgis-hud.opendata.arcgis.com/datasets/52a6a3a2ef1e4489837f97dcedaf8e27_0/data?geometry=-124.587%2C47.205%2C-119.314%2C47.854&orderBy=PARTICIPANT_CODE
+kingCountyPublicHousing <- read.csv("data/kingCountyPublicHousing.csv", stringsAsFactors = FALSE)%>% 
+                           mutate(tract = TRACT2KX) %>%
+                           mutate(tractNumber = tract/100) %>%
+                           filter(tractNumber < 400) %>% rename("x" = X, "y" = Y)
+
+# get the number of affordable housing developments by tract
+affordableHousingByTract <- kingCountyPublicHousing %>% 
+  group_by(tractNumber) %>% 
+  summarise(publicDevelopmentHousingInTract = n_distinct(BUILDING_NUMBER))
+
+# get the number of "large" affordable housing developments
+LargePublicHousingDevelopments <- kingCountyPublicHousing %>% 
+  filter(TOTAL_DWELLING_UNITS > largeDevelopment) %>% 
+  group_by(tractNumber) %>% 
+  summarise(LargePublicHousingDevelopments = n_distinct(BUILDING_NUMBER))
+
+# get the total number of affordable housing units
+totalAffordableHousingUnitsByTract <- kingCountyPublicHousing %>% 
+  group_by(tractNumber) %>% 
+  summarise(totalAffordableHousingUnitsByTract = sum(TOTAL_DWELLING_UNITS))
+
+# get the total number of affordable housing units in developments with more than 9 units
+totalLargeDevelopmentAffordableHousing <- kingCountyPublicHousing %>% 
+  group_by(tractNumber) %>% 
+  summarise(totalLargeDevelopmentAffordableHousing = sum(TOTAL_DWELLING_UNITS > largeDevelopment))
+
+
+# get shapes ready for map of Seattle
+king1 <- get_acs(geography = "tract", variables = relevantVariables,
+                output = "wide", state = "WA", county = "King", geometry = TRUE, cb = FALSE) %>% 
+       mutate(tract = str_split(NAME, "; ", simplify = TRUE)[, 1]) %>%
+       mutate(tractNumber = as.numeric(str_split(tract, " ", simplify = TRUE)[, 3]))
+
+# merge the datasets
+kingCountyInfo <- merge(kingCountyDemographics, affordableHousingByTract, by = "tractNumber", all = TRUE)
+kingCountyInfo <- merge(kingCountyInfo, LargePublicHousingDevelopments, by = "tractNumber", all = TRUE)
+kingCountyInfo <- merge(kingCountyInfo, totalAffordableHousingUnitsByTract, by = "tractNumber", all = TRUE)
+kingCountyInfo <- merge(kingCountyInfo, totalLargeDevelopmentAffordableHousing, by = "tractNumber", all = TRUE)
+kingCountyInfo[is.na(kingCountyInfo)] <- 0
+kingCountyInfo <- merge(king1, kingCountyInfo, by = "tractNumber") %>%
+                  rename("total_population" = B01003_001E, "white_alone" = B02001_002E, "black_alone" = B02001_003E, "asian_alone" = B02001_005E)
+
+# for cleaning up water
+st_erase <- function(x, y) {
+  st_difference(x, st_union(y))
+}
+king_water <- area_water("WA", "King", class = "sf") 
+kingCountyComplete <- st_erase(kingCountyInfo, king_water)
+
+# create map of all public housing
+publicHousingSpatialData <- SpatialPointsDataFrame(kingCountyPublicHousing %>% 
+                                                     filter(TOTAL_DWELLING_UNITS != 0) %>% 
+                                                     select(x, y), kingCountyPublicHousing %>% 
+                                                     filter(TOTAL_DWELLING_UNITS != 0))
+
+mapview(kingCountyComplete, zcol = "MedianHouseholdIncome", legend = TRUE) + mapview(publicHousingSpatialData, cex = "TOTAL_DWELLING_UNITS")
+
+# create map of only including larger scale public housing projects
+publicHousingSpatialData <- SpatialPointsDataFrame(kingCountyPublicHousing %>% filter(TOTAL_DWELLING_UNITS > largeDevelopment) %>% select(x, y), 
+                                                   kingCountyPublicHousing %>% filter(TOTAL_DWELLING_UNITS > largeDevelopment))
+mapview(kingCountyComplete, zcol = "MedianHouseholdIncome", legend = TRUE) + mapview(publicHousingSpatialData, cex = "TOTAL_DWELLING_UNITS", color = "red")
+
+# remove spatial information to run correlation and regression
+publicHousing <- kingCountyInfo %>% 
+  select(publicDevelopmentHousingInTract, LargePublicHousingDevelopments, totalAffordableHousingUnitsByTract, totalLargeDevelopmentAffordableHousing, white_alone, black_alone, asian_alone, PercentESL, MedianHouseholdIncome, PercentPOC) %>% 
+  st_drop_geometry() %>% 
+  rename("PublicHousingDevelopments" = publicDevelopmentHousingInTract,"TotalAffordableUnits" = totalAffordableHousingUnitsByTract, "LargeTotalAffordabelUnits" = totalLargeDevelopmentAffordableHousing, "WhitePopulation" = white_alone, "BlackPopulation" = black_alone, "AsianPopulation" = asian_alone)
+
+# check correlation 
+publicHousingCorrelation <- publicHousing %>% select(where(is.numeric)) %>% cor(use="complete.obs")
+corrplot(publicHousingCorrelation, method = "ellipse")
+corrplot(publicHousingCorrelation, method = "color", number.cex = 0.75, addCoef.col="black")
+
+
+# run a regression on for total affordable housing developments:
+publicHousingRegressionTotalDevelopments <- lm(PublicHousingDevelopments ~ WhitePopulation + BlackPopulation + AsianPopulation + PercentESL + MedianHouseholdIncome, data = publicHousing)
+summary(publicHousingRegressionTotalDevelopments)
+
+# run a regression on for total "large" affordable housing developments:
+largePublicHousingRegressionTotalDevelopments <- lm(LargePublicHousingDevelopments ~ WhitePopulation + BlackPopulation + AsianPopulation + PercentESL + MedianHouseholdIncome, data = publicHousing)
+summary(largePublicHousingRegressionTotalDevelopments)
+
+# run a regression on for total affordable housing units for all developments:
+publicHousingRegressionTotalUnitsAllDevelopments <- lm(TotalAffordableUnits ~ WhitePopulation + BlackPopulation + AsianPopulation + PercentESL + MedianHouseholdIncome, data = publicHousing)
+summary(publicHousingRegressionTotalUnitsAllDevelopments)
+
+# run a regression on for total affordable housing units for "large" developments:
+publicHousingRegressionTotalUnitsLargeDevelopments <- lm(LargeTotalAffordabelUnits ~ WhitePopulation + BlackPopulation + AsianPopulation + PercentESL + MedianHouseholdIncome, data = publicHousing)
+summary(publicHousingRegressionTotalUnitsLargeDevelopments)
+```
+
